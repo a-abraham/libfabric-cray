@@ -740,6 +740,91 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	return FI_SUCCESS;
 }
 
+int _gnix_rma_fill_pd_more(struct gnix_fab_req *req,
+			   struct gnix_tx_descriptor *txd,
+			   gni_mem_handle_t *rem_mdh,
+			   int more_write)
+{
+	// Count number of fab requests remaining in EP's more_write list
+	// malloc space
+		// where do we free this space?
+	// loop through and fill out a PD for each Fab req
+	return 0;  //Delete
+
+}
+
+int _gnix_rma_more_post_req(void *data)
+{
+	struct gnix_fab_req *fab_req = (struct gnix_fab_req *)data;
+	struct gnix_fid_ep *ep = fab_req->gnix_ep;
+	struct gnix_nic *nic = ep->nic;
+	struct gnix_fid_mem_desc *loc_md;
+	struct gnix_tx_descriptor *txd;
+	gni_mem_handle_t mdh;
+	gni_return_t status;
+	int rc, more_write;
+
+	more_write = (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) ? 1 : 0;
+
+	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
+		rc = __gnix_rma_post_err_no_retrans(fab_req, FI_EOPNOTSUPP);
+		if (rc != FI_SUCCESS)
+			GNIX_WARN(FI_LOG_EP_DATA,
+				  "__gnix_rma_post_err_no_retrans() failed: %d\n",
+				  rc);
+		return -FI_ECANCELED;
+	}
+
+	rc = _gnix_nic_tx_alloc(nic, &txd);
+	if (rc) {
+		GNIX_INFO(FI_LOG_EP_DATA,
+				"_gnix_nic_tx_alloc() failed: %d\n",
+				rc);
+		return -FI_ENOSPC;
+	}
+
+	txd->completer_fn = __gnix_rma_txd_complete;
+	txd->req = fab_req;
+
+	_gnix_convert_key_to_mhdl_no_crc(
+			(gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
+			&mdh);
+	txd->gni_desc.type = __gnix_fr_post_type(fab_req->type, 0); /* 0 okay? */
+	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
+	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
+
+	_gnix_rma_fill_pd_more(fab_req, txd, &mdh, more_write);
+
+	/* Not sure if this portion is necessary or not - review
+	 * This might only be needed when doing Writes */
+	txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
+	txd->gni_desc.length = fab_req->rma.len;
+	txd->gni_desc.remote_addr = (uint64_t)fab_req->rma.rem_addr;
+
+	loc_md = (struct gnix_fid_mem_desc *)fab_req->rma.loc_md;
+	if (loc_md) {
+		txd->gni_desc.local_mem_hndl = loc_md->mem_hndl;
+	}
+	//
+	txd->gni_desc.remote_mem_hndl = mdh;
+	txd->gni_desc.rdma_mode = 0; /* check flags */
+	txd->gni_desc.src_cq_hndl = nic->tx_cq; /* check flags */
+
+	GNIX_LOG_DUMP_TXD(txd);
+
+	COND_ACQUIRE(nic->requires_lock, &nic->lock);
+	status = GNI_CtPostFma(fab_req->vc->gni_ep, &txd->gni_desc);
+
+	COND_RELEASE(nic->requires_lock, &nic->lock);
+
+	if (status != GNI_RC_SUCCESS) {
+		_gnix_nic_tx_free(nic, txd);
+		GNIX_WARN(FI_LOG_EP_DATA, "GNI_Post*() failed: %s\n",
+			  gni_err_str[status]);
+	}
+
+	return gnixu_to_fi_errno(status);
+}
 int _gnix_rma_post_req(void *data)
 {
 	struct gnix_fab_req *fab_req = (struct gnix_fab_req *)data;
@@ -881,6 +966,8 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 	int rc;
 	int rdma;
 	struct fid_mr *auto_mr = NULL;
+	struct slist_entry *list_entry;
+	struct gnix_fab_req *more_req;
 
 	if (!(flags & FI_INJECT) && !ep->send_cq &&
 	    (((fr_type == GNIX_FAB_RQ_RDMA_WRITE) && !ep->write_cntr) ||
@@ -993,6 +1080,47 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 
 	if (rdma) {
 		req->flags |= GNIX_RMA_RDMA;
+	}
+
+	/* Add reads/writes to FI_MORE list when FI_MORE is present.
+	 * When FI_MORE is not present, if FI_MORE lists are not empty
+	 * this is the first message without FI_MORE. */
+	if ((flags & FI_MORE) ||
+	    (!(slist_empty(&ep->more_write)) || !(slist_empty(&ep->more_read)))) {
+		req->work_fn = _gnix_rma_more_post_req;
+		if (fr_type == GNIX_FAB_RQ_RDMA_READ) {
+			slist_insert_tail(&req->rma.sle, &ep->more_read);
+			return FI_SUCCESS;
+		}
+		else {
+			slist_insert_tail(&req->rma.sle, &ep->more_write);
+			return FI_SUCCESS;
+		}
+	}
+
+	/* Initiate reads and writes on first message without FI_MORE */
+	if (!(flags & FI_MORE) &&
+	    (!(slist_empty(&ep->more_write)) || !(slist_empty(&ep->more_read)))) {
+		if (!(slist_empty(&ep->more_write))) {
+			list_entry = slist_remove_head(&ep->more_write);
+			if (list_entry) {
+				more_req = container_of(list_entry,
+							struct gnix_fab_req,
+							rma.sle);
+				_gnix_vc_queue_tx_req(more_req);
+			}
+			// Error Checking
+		}
+		if (!(slist_empty(&ep->more_read))) {
+			list_entry = slist_remove_head(&ep->more_read);
+			if (list_entry) {
+				more_req = container_of(list_entry,
+							struct gnix_fab_req,
+							rma.sle);
+				_gnix_vc_queue_tx_req(more_req);
+			}
+			// Error Checking
+		}
 	}
 
 	GNIX_DEBUG(FI_LOG_EP_DATA, "Queuing (%p %p %d)\n",

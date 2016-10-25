@@ -331,6 +331,7 @@ struct gnix_tx_descriptor {
 		struct {
 			gni_post_descriptor_t        gni_desc;
 			gni_ct_get_post_descriptor_t gni_ct_descs[2];
+			void			     *gni_more_ct_descs;
 		};
 		struct gnix_smsg_eager_hdr           eager_hdr;
 		struct gnix_smsg_rndzv_start_hdr     rndzv_start_hdr;

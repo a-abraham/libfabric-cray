@@ -508,6 +508,8 @@ struct gnix_fid_ep {
 	struct gnix_htd_pool htd_pool;
 	struct gnix_reference ref_cnt;
 	struct gnix_fid_ep_ops_en ep_ops;
+	struct slist more_read;
+	struct slist more_write;
 };
 
 #define GNIX_EP_RDM(type)         (type == FI_EP_RDM)
@@ -663,6 +665,7 @@ struct gnix_fab_req_rma {
 	uint64_t                 imm;
 	atomic_t                 outstanding_txds;
 	gni_return_t             status;
+	struct slist_entry       sle;
 };
 
 struct gnix_fab_req_msg {
