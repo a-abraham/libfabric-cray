@@ -740,15 +740,46 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	return FI_SUCCESS;
 }
 
+
+static int _gnix_get_fab_req_from_slist(struct gnix_fid_ep *ep, struct gnix_fab_req **more_req)
+{
+	struct slist_entry *list_entry;
+	struct gnix_fab_req *more_req_p;
+
+	list_entry = slist_remove_head(&ep->more_write);
+	if (list_entry) {
+		more_req_p = container_of(list_entry,
+					  struct gnix_fab_req,
+					  rma.sle);
+		*more_req = more_req_p;
+	}
+	return 0;
+}
+
 int _gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 			   struct gnix_tx_descriptor *txd,
 			   gni_mem_handle_t *rem_mdh,
-			   int more_write)
+			   int write_req)
 {
+	struct gnix_fid_ep *ep = req->gnix_ep;
+	struct slist *sl;
+	struct slist_entry *item, *prev;
+	int entries;
+
+	if (write_req) {
+		sl = &ep->more_write;
+	} else {
+		sl = &ep->more_read;
+	}
+
 	// Count number of fab requests remaining in EP's more_write list
+	slist_foreach(sl, item, prev) {
+		entries++;
+	}
 	// malloc space
 		// where do we free this space?
 	// loop through and fill out a PD for each Fab req
+
 	return 0;  //Delete
 
 }
@@ -762,9 +793,9 @@ int _gnix_rma_more_post_req(void *data)
 	struct gnix_tx_descriptor *txd;
 	gni_mem_handle_t mdh;
 	gni_return_t status;
-	int rc, more_write;
+	int rc, write_req;
 
-	more_write = (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) ? 1 : 0;
+	write_req = (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) ? 1 : 0;
 
 	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
 		rc = __gnix_rma_post_err_no_retrans(fab_req, FI_EOPNOTSUPP);
@@ -793,7 +824,7 @@ int _gnix_rma_more_post_req(void *data)
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	_gnix_rma_fill_pd_more(fab_req, txd, &mdh, more_write);
+	_gnix_rma_fill_pd_more(fab_req, txd, &mdh, write_req);
 
 	/* Not sure if this portion is necessary or not - review
 	 * This might only be needed when doing Writes */
