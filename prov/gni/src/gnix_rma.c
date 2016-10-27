@@ -741,7 +741,8 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 }
 
 
-static int _gnix_get_fab_req_from_slist(struct gnix_fid_ep *ep, struct gnix_fab_req **more_req)
+static int __gnix_get_fab_req_from_slist(struct gnix_fid_ep *ep,
+					 struct gnix_fab_req **more_req)
 {
 	struct slist_entry *list_entry;
 	struct gnix_fab_req *more_req_p;
@@ -752,19 +753,23 @@ static int _gnix_get_fab_req_from_slist(struct gnix_fid_ep *ep, struct gnix_fab_
 					  struct gnix_fab_req,
 					  rma.sle);
 		*more_req = more_req_p;
+		return 1;
 	}
 	return 0;
 }
 
-int _gnix_rma_fill_pd_more(struct gnix_fab_req *req,
-			   struct gnix_tx_descriptor *txd,
-			   gni_mem_handle_t *rem_mdh,
-			   int write_req)
+static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
+				    struct gnix_tx_descriptor *txd,
+				    gni_mem_handle_t *rem_mdh,
+				    int write_req)
 {
 	struct gnix_fid_ep *ep = req->gnix_ep;
+	gni_ct_put_post_descriptor_t *more_put;
+	gni_ct_get_post_descriptor_t *more_get;
+	struct gnix_fab_req *more_req = NULL;
 	struct slist *sl;
 	struct slist_entry *item, *prev;
-	int entries;
+	int entries = 0;
 
 	if (write_req) {
 		sl = &ep->more_write;
@@ -772,16 +777,49 @@ int _gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 		sl = &ep->more_read;
 	}
 
-	// Count number of fab requests remaining in EP's more_write list
+	// TODO - determine if I can actually use this function...
 	slist_foreach(sl, item, prev) {
 		entries++;
 	}
-	// malloc space
-		// where do we free this space?
-	// loop through and fill out a PD for each Fab req
 
-	return 0;  //Delete
+	if (write_req) {
+		txd->gni_more_ct_descs = malloc(entries*sizeof(gni_ct_put_post_descriptor_t));
+		more_put = (gni_ct_put_post_descriptor_t *)txd->gni_more_ct_descs;
+	}
+	else {
+		txd->gni_more_ct_descs = malloc(entries*sizeof(gni_ct_get_post_descriptor_t));
+		more_get = (gni_ct_get_post_descriptor_t *)txd->gni_more_ct_descs;
+	}
+	for(int idx = 0; idx < entries; idx++) {
+		//Remove List Head
+		if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
+			// Error Handling
+		}
 
+		if (write_req) {
+			more_put[idx].ep_hndl = more_req->vc->gni_ep;
+			//more_put[idx].length = TODO find the parameter for the length
+			more_put[idx].remote_addr = more_req->rma.rem_addr;
+			more_put[idx].remote_mem_hndl = *rem_mdh;
+			more_put[idx].local_addr = (uint64_t)txd->int_buf;
+
+			if (idx < entries)
+				more_put[idx].next_descr = &more_put[idx + 1];
+			else
+				more_put[idx].next_descr = NULL;
+		}
+		else {
+			//Some stuff with alignment for reads/gets
+
+			if (idx < entries)
+				more_get[idx].next_descr = &more_get[idx + 1];
+			else
+				more_get[idx].next_descr = NULL;
+
+		}
+
+		//GNIX_INFO(FI_LOG_EP_DATA,
+	}
 }
 
 int _gnix_rma_more_post_req(void *data)
@@ -824,7 +862,7 @@ int _gnix_rma_more_post_req(void *data)
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	_gnix_rma_fill_pd_more(fab_req, txd, &mdh, write_req);
+	__gnix_rma_fill_pd_more(fab_req, txd, &mdh, write_req);
 
 	/* Not sure if this portion is necessary or not - review
 	 * This might only be needed when doing Writes */
@@ -997,7 +1035,6 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 	int rc;
 	int rdma;
 	struct fid_mr *auto_mr = NULL;
-	struct slist_entry *list_entry;
 	struct gnix_fab_req *more_req;
 
 	if (!(flags & FI_INJECT) && !ep->send_cq &&
@@ -1133,24 +1170,16 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 	if (!(flags & FI_MORE) &&
 	    (!(slist_empty(&ep->more_write)) || !(slist_empty(&ep->more_read)))) {
 		if (!(slist_empty(&ep->more_write))) {
-			list_entry = slist_remove_head(&ep->more_write);
-			if (list_entry) {
-				more_req = container_of(list_entry,
-							struct gnix_fab_req,
-							rma.sle);
-				_gnix_vc_queue_tx_req(more_req);
+			if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
+				//Error checking/handling
 			}
-			// Error Checking
+			_gnix_vc_queue_tx_req(more_req);
 		}
 		if (!(slist_empty(&ep->more_read))) {
-			list_entry = slist_remove_head(&ep->more_read);
-			if (list_entry) {
-				more_req = container_of(list_entry,
-							struct gnix_fab_req,
-							rma.sle);
-				_gnix_vc_queue_tx_req(more_req);
+			if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
+				//Error checking/handling
 			}
-			// Error Checking
+			_gnix_vc_queue_tx_req(more_req);
 		}
 	}
 
