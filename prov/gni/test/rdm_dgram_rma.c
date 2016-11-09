@@ -731,6 +731,69 @@ Test(dgram_rma, writemsg_retrans)
 	xfer_for_each_size(do_writemsg, 8, BUF_SZ);
 }
 
+void do_writemsg_more(int len)
+{
+        int ret;
+        ssize_t sz;
+        struct fi_cq_tagged_entry cqe = { (void *) -1, UINT_MAX, UINT_MAX,
+                                          (void *) -1, UINT_MAX, UINT_MAX };
+        struct iovec iov;
+        struct fi_msg_rma msg;
+        struct fi_rma_iov rma_iov;
+        uint64_t w[2] = {0}, r[2] = {0}, w_e[2] = {0}, r_e[2] = {0};
+
+        iov.iov_base = source;
+        iov.iov_len = len;
+
+        rma_iov.addr = (uint64_t)target;
+        rma_iov.len = len;
+        rma_iov.key = mr_key[1];
+
+        msg.msg_iov = &iov;
+        msg.desc = (void **)loc_mr;
+        msg.iov_count = 1;
+        msg.addr = gni_addr[1];
+        msg.rma_iov = &rma_iov;
+        msg.rma_iov_count = 1;
+        msg.context = target;
+        msg.data = (uint64_t)target;
+
+        init_data(source, len, 0xef);
+        init_data(target, len, 0);
+
+	sz = fi_writemsg(ep[0], &msg, FI_MORE);
+        cr_assert_eq(sz, 0);
+
+        sz = fi_writemsg(ep[0], &msg, 0);
+        cr_assert_eq(sz, 0);
+
+
+        while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
+                pthread_yield();
+        }
+
+        if (dgm_fail) {
+                cr_assert_eq(ret, -FI_EAVAIL);
+                return;
+        }
+        cr_assert_eq(ret, 1);
+        rdm_rma_check_tcqe(&cqe, target, FI_RMA | FI_WRITE, 0);
+
+        w[0] = 1;
+        rdm_rma_check_cntrs(w, r, w_e, r_e);
+
+        dbg_printf("got write context event!\n");
+
+        cr_assert(check_data(source, target, len), "Data mismatch");
+
+}
+
+Test(rdm_rma, writemsgmore)
+{
+	//xfer_for_each_size(do_writemsg_more, 8, BUF_SZ);
+	do_writemsg_more(8);
+}
+
 /*
  * write_fence should be validated by inspecting debug.
  *

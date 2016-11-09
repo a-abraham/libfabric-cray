@@ -777,10 +777,11 @@ static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 		sl = &ep->more_read;
 	}
 
-	// TODO - determine if I can actually use this function...
 	slist_foreach(sl, item, prev) {
 		entries++;
 	}
+
+	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered chain function. %d sub desc to be populated", entries);
 
 	if (write_req) {
 		txd->gni_more_ct_descs = malloc(entries*sizeof(gni_ct_put_post_descriptor_t));
@@ -817,8 +818,6 @@ static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 				more_get[idx].next_descr = NULL;
 
 		}
-
-		//GNIX_INFO(FI_LOG_EP_DATA,
 	}
 }
 
@@ -834,6 +833,8 @@ int _gnix_rma_more_post_req(void *data)
 	int rc, write_req;
 
 	write_req = (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) ? 1 : 0;
+
+	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered work_fn");
 
 	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
 		rc = __gnix_rma_post_err_no_retrans(fab_req, FI_EOPNOTSUPP);
@@ -1158,21 +1159,26 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 		req->work_fn = _gnix_rma_more_post_req;
 		if (fr_type == GNIX_FAB_RQ_RDMA_READ) {
 			slist_insert_tail(&req->rma.sle, &ep->more_read);
-			return FI_SUCCESS;
 		}
 		else {
 			slist_insert_tail(&req->rma.sle, &ep->more_write);
-			return FI_SUCCESS;
+			GNIX_INFO(FI_LOG_EP_DATA, "MORE: Adding EP to more_write\n");
 		}
+		if (flags & FI_MORE)
+			return FI_SUCCESS;
 	}
 
 	/* Initiate reads and writes on first message without FI_MORE */
 	if (!(flags & FI_MORE) &&
 	    (!(slist_empty(&ep->more_write)) || !(slist_empty(&ep->more_read)))) {
+		GNIX_INFO(FI_LOG_EP_DATA, "MORE: First message without FI_MORE\n");
 		if (!(slist_empty(&ep->more_write))) {
+			GNIX_INFO(FI_LOG_EP_DATA, "MORE: more_write, not empty.\n");
 			if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
 				//Error checking/handling
+				GNIX_INFO(FI_LOG_EP_DATA, "MORE: FAILED to get fab_request from more_write");
 			}
+			GNIX_INFO(FI_LOG_EP_DATA, "MORE: got fab_request from more_write. Queuing Request\n");
 			_gnix_vc_queue_tx_req(more_req);
 		}
 		if (!(slist_empty(&ep->more_read))) {
@@ -1181,8 +1187,8 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 			}
 			_gnix_vc_queue_tx_req(more_req);
 		}
+		return FI_SUCCESS;
 	}
-
 	GNIX_DEBUG(FI_LOG_EP_DATA, "Queuing (%p %p %d)\n",
 		  (void *)loc_addr, (void *)rem_addr, len);
 
