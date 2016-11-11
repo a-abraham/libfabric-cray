@@ -740,48 +740,25 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	return FI_SUCCESS;
 }
 
-
-static int __gnix_get_fab_req_from_slist(struct gnix_fid_ep *ep,
-					 struct gnix_fab_req **more_req)
-{
-	struct slist_entry *list_entry;
-	struct gnix_fab_req *more_req_p;
-
-	list_entry = slist_remove_head(&ep->more_write);
-	if (list_entry) {
-		more_req_p = container_of(list_entry,
-					  struct gnix_fab_req,
-					  rma.sle);
-		*more_req = more_req_p;
-		return 1;
-	}
-	return 0;
-}
-
 static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 				    struct gnix_tx_descriptor *txd,
 				    gni_mem_handle_t *rem_mdh,
 				    int write_req)
 {
-	struct gnix_fid_ep *ep = req->gnix_ep;
 	gni_ct_put_post_descriptor_t *more_put;
 	gni_ct_get_post_descriptor_t *more_get;
 	struct gnix_fab_req *more_req = NULL;
-	struct slist *sl;
-	struct slist_entry *item, *prev;
-	int entries = 0;
+	struct slist_entry *current;
+	int entries = 0, idx = 0;
 
-	if (write_req) {
-		sl = &ep->more_write;
-	} else {
-		sl = &ep->more_read;
-	}
-
-	slist_foreach(sl, item, prev) {
+	current = req->rma.sle.next; // First sub descriptor
+	while (current != NULL) {
+		GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered While loop to count descs\n");
 		entries++;
+		current = current->next;
 	}
 
-	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered chain function. %d sub desc to be populated", entries);
+	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered chain function. %d sub desc to be populated\n", entries);
 
 	if (write_req) {
 		txd->gni_more_ct_descs = malloc(entries*sizeof(gni_ct_put_post_descriptor_t));
@@ -791,12 +768,13 @@ static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 		txd->gni_more_ct_descs = malloc(entries*sizeof(gni_ct_get_post_descriptor_t));
 		more_get = (gni_ct_get_post_descriptor_t *)txd->gni_more_ct_descs;
 	}
-	for(int idx = 0; idx < entries; idx++) {
-		//Remove List Head
-		if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
-			// Error Handling
-		}
 
+	current = req->rma.sle.next;
+	while (current != NULL) {
+		//Get fab_req pointer
+		more_req = container_of(current, struct gnix_fab_req, rma.sle);
+
+		//populate txd
 		if (write_req) {
 			more_put[idx].ep_hndl = more_req->vc->gni_ep;
 			//more_put[idx].length = TODO find the parameter for the length
@@ -818,6 +796,8 @@ static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 				more_get[idx].next_descr = NULL;
 
 		}
+		idx++;
+		current = current->next;
 	}
 }
 
@@ -834,7 +814,7 @@ int _gnix_rma_more_post_req(void *data)
 
 	write_req = (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) ? 1 : 0;
 
-	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered work_fn");
+	GNIX_INFO(FI_LOG_EP_DATA, "MORE: Entered work_fn\n");
 
 	if (!gnix_ops_allowed(ep, fab_req->vc->peer_caps, fab_req->flags)) {
 		rc = __gnix_rma_post_err_no_retrans(fab_req, FI_EOPNOTSUPP);
@@ -1037,6 +1017,7 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 	int rdma;
 	struct fid_mr *auto_mr = NULL;
 	struct gnix_fab_req *more_req;
+	struct slist_entry *sle;
 
 	if (!(flags & FI_INJECT) && !ep->send_cq &&
 	    (((fr_type == GNIX_FAB_RQ_RDMA_WRITE) && !ep->write_cntr) ||
@@ -1174,17 +1155,16 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 		GNIX_INFO(FI_LOG_EP_DATA, "MORE: First message without FI_MORE\n");
 		if (!(slist_empty(&ep->more_write))) {
 			GNIX_INFO(FI_LOG_EP_DATA, "MORE: more_write, not empty.\n");
-			if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
-				//Error checking/handling
-				GNIX_INFO(FI_LOG_EP_DATA, "MORE: FAILED to get fab_request from more_write");
-			}
+			sle = ep->more_write.head;
+			more_req = container_of(sle, struct gnix_fab_req, rma.sle);
+
 			GNIX_INFO(FI_LOG_EP_DATA, "MORE: got fab_request from more_write. Queuing Request\n");
 			_gnix_vc_queue_tx_req(more_req);
 		}
 		if (!(slist_empty(&ep->more_read))) {
-			if (!(__gnix_get_fab_req_from_slist(ep, &more_req))) {
-				//Error checking/handling
-			}
+			GNIX_INFO(FI_LOG_EP_DATA, "MORE: more_read, not empty.\n");
+			sle = ep->more_read.head;
+			more_req = container_of(sle, struct gnix_fab_req, rma.sle);
 			_gnix_vc_queue_tx_req(more_req);
 		}
 		return FI_SUCCESS;
