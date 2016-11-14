@@ -758,24 +758,19 @@ void do_writemsg_more(int len)
         msg.context = target;
         msg.data = (uint64_t)target;
 
-        init_data(source, len, 0xef);
-        init_data(target, len, 0);
+	init_data(source, len, 0xef);
+	init_data(target, len, 0);
 
 	sz = fi_writemsg(ep[0], &msg, FI_MORE);
-        cr_assert_eq(sz, 0);
+	cr_assert_eq(sz, 0);
 
-        sz = fi_writemsg(ep[0], &msg, 0);
-        cr_assert_eq(sz, 0);
+	sz = fi_writemsg(ep[0], &msg, 0);
+	cr_assert_eq(sz, 0);
 
+	while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
+		pthread_yield();
+	}
 
-        while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
-                pthread_yield();
-        }
-
-        if (dgm_fail) {
-                cr_assert_eq(ret, -FI_EAVAIL);
-                return;
-        }
         cr_assert_eq(ret, 1);
         rdm_rma_check_tcqe(&cqe, target, FI_RMA | FI_WRITE, 0);
 

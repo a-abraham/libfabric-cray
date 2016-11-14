@@ -371,6 +371,29 @@ static int __gnix_rma_send_data_req(void *arg)
 	return gnixu_to_fi_errno(status);
 }
 
+static int __gnix_rma_more_txd_complete(void *arg, gni_return_t tx_status)
+{
+	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
+	struct gnix_fab_req *req = txd->req;
+	int rc = FI_SUCCESS;
+
+	if (tx_status != GNI_RC_SUCCESS) {
+		_gnix_nic_tx_free(req->gnix_ep->nic, txd);
+		return __gnix_rma_post_err(req, FI_ECANCELED);
+	}
+	/* complete request */
+
+	rc = __gnix_rma_send_completion(req->vc->ep, req);
+	if (rc != FI_SUCCESS)
+		GNIX_WARN(FI_LOG_EP_DATA,
+			  "__gnix_rma_send_completion() failed: %d\n",
+			  rc);
+
+	__gnix_rma_fr_complete(req);
+	return FI_SUCCESS;
+
+}
+
 static int __gnix_rma_txd_complete(void *arg, gni_return_t tx_status)
 {
 	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
@@ -740,7 +763,7 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	return FI_SUCCESS;
 }
 
-static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
+static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 				    struct gnix_tx_descriptor *txd,
 				    gni_mem_handle_t *rem_mdh,
 				    int write_req)
@@ -777,9 +800,14 @@ static void __gnix_rma_fill_pd_more(struct gnix_fab_req *req,
 		//populate txd
 		if (write_req) {
 			more_put[idx].ep_hndl = more_req->vc->gni_ep;
-			//more_put[idx].length = TODO find the parameter for the length
+			more_put[idx].length = more_req->rma.len;
 			more_put[idx].remote_addr = more_req->rma.rem_addr;
-			more_put[idx].remote_mem_hndl = *rem_mdh;
+			more_put[idx].remote_mem_hndl = *rem_mdh;	//Probably need the portion below 
+			/*
+			        _gnix_convert_key_to_mhdl_no_crc(
+                        (gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
+                        &mdh);
+			*/
 			more_put[idx].local_addr = (uint64_t)txd->int_buf;
 
 			if (idx < entries)
@@ -833,29 +861,32 @@ int _gnix_rma_more_post_req(void *data)
 		return -FI_ENOSPC;
 	}
 
-	txd->completer_fn = __gnix_rma_txd_complete;
+	txd->completer_fn = __gnix_rma_more_txd_complete;
 	txd->req = fab_req;
 
 	_gnix_convert_key_to_mhdl_no_crc(
 			(gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
 			&mdh);
+
 	txd->gni_desc.type = __gnix_fr_post_type(fab_req->type, 0); /* 0 okay? */
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	__gnix_rma_fill_pd_more(fab_req, txd, &mdh, write_req);
+	__gnix_rma_more_fill_pd(fab_req, txd, &mdh, write_req);
 
 	/* Not sure if this portion is necessary or not - review
 	 * This might only be needed when doing Writes */
-	txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
-	txd->gni_desc.length = fab_req->rma.len;
-	txd->gni_desc.remote_addr = (uint64_t)fab_req->rma.rem_addr;
+	if (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) {
+		GNIX_INFO(FI_LOG_EP_DATA, "MORE: Doing a Write\n");
+		txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
+		txd->gni_desc.length = fab_req->rma.len;
+		txd->gni_desc.remote_addr = (uint64_t)fab_req->rma.rem_addr;
 
-	loc_md = (struct gnix_fid_mem_desc *)fab_req->rma.loc_md;
-	if (loc_md) {
-		txd->gni_desc.local_mem_hndl = loc_md->mem_hndl;
+		loc_md = (struct gnix_fid_mem_desc *)fab_req->rma.loc_md;
+		if (loc_md) {
+			txd->gni_desc.local_mem_hndl = loc_md->mem_hndl;
+		}
 	}
-	//
 	txd->gni_desc.remote_mem_hndl = mdh;
 	txd->gni_desc.rdma_mode = 0; /* check flags */
 	txd->gni_desc.src_cq_hndl = nic->tx_cq; /* check flags */
@@ -1160,12 +1191,14 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 
 			GNIX_INFO(FI_LOG_EP_DATA, "MORE: got fab_request from more_write. Queuing Request\n");
 			_gnix_vc_queue_tx_req(more_req);
+			slist_init(&ep->more_write);
 		}
 		if (!(slist_empty(&ep->more_read))) {
 			GNIX_INFO(FI_LOG_EP_DATA, "MORE: more_read, not empty.\n");
 			sle = ep->more_read.head;
 			more_req = container_of(sle, struct gnix_fab_req, rma.sle);
 			_gnix_vc_queue_tx_req(more_req);
+			slist_init(&ep->more_read);
 		}
 		return FI_SUCCESS;
 	}
