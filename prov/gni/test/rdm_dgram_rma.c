@@ -772,9 +772,15 @@ void do_writemsg_more(int len)
 	}
 
         cr_assert_eq(ret, 1);
-        rdm_rma_check_tcqe(&cqe, target, FI_RMA | FI_WRITE, 0);
 
-        w[0] = 1;
+	while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
+		pthread_yield();
+	}
+
+        cr_assert_eq(ret, 1);
+	rdm_rma_check_tcqe(&cqe, target, FI_RMA | FI_WRITE, 0);
+
+        w[0] = 2;
         rdm_rma_check_cntrs(w, r, w_e, r_e);
 
         dbg_printf("got write context event!\n");

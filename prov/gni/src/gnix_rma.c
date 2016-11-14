@@ -375,6 +375,8 @@ static int __gnix_rma_more_txd_complete(void *arg, gni_return_t tx_status)
 {
 	struct gnix_tx_descriptor *txd = (struct gnix_tx_descriptor *)arg;
 	struct gnix_fab_req *req = txd->req;
+	struct gnix_fab_req *more_req;
+	struct slist_entry *current;
 	int rc = FI_SUCCESS;
 
 	if (tx_status != GNI_RC_SUCCESS) {
@@ -388,10 +390,21 @@ static int __gnix_rma_more_txd_complete(void *arg, gni_return_t tx_status)
 		GNIX_WARN(FI_LOG_EP_DATA,
 			  "__gnix_rma_send_completion() failed: %d\n",
 			  rc);
-
 	__gnix_rma_fr_complete(req);
-	return FI_SUCCESS;
 
+	current = req->rma.sle.next;	/* First sub descriptor */
+	while (current != NULL) {
+		more_req = container_of(current, struct gnix_fab_req, rma.sle);
+
+		rc = __gnix_rma_send_completion(more_req->vc->ep, more_req);
+		if (rc != FI_SUCCESS)
+		GNIX_WARN(FI_LOG_EP_DATA,
+			  "__gnix_rma_send_completion() failed: %d\n",
+			  rc);
+		__gnix_rma_fr_complete(more_req);
+		current = current->next;
+	}
+	return FI_SUCCESS;
 }
 
 static int __gnix_rma_txd_complete(void *arg, gni_return_t tx_status)
@@ -765,12 +778,12 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 
 static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 				    struct gnix_tx_descriptor *txd,
-				    gni_mem_handle_t *rem_mdh,
 				    int write_req)
 {
 	gni_ct_put_post_descriptor_t *more_put;
 	gni_ct_get_post_descriptor_t *more_get;
-	struct gnix_fab_req *more_req = NULL;
+	gni_mem_handle_t mdh;
+	struct gnix_fab_req *more_req;
 	struct slist_entry *current;
 	int entries = 0, idx = 0;
 
@@ -802,13 +815,12 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 			more_put[idx].ep_hndl = more_req->vc->gni_ep;
 			more_put[idx].length = more_req->rma.len;
 			more_put[idx].remote_addr = more_req->rma.rem_addr;
-			more_put[idx].remote_mem_hndl = *rem_mdh;	//Probably need the portion below 
-			/*
-			        _gnix_convert_key_to_mhdl_no_crc(
-                        (gnix_mr_key_t *)&fab_req->rma.rem_mr_key,
-                        &mdh);
-			*/
 			more_put[idx].local_addr = (uint64_t)txd->int_buf;
+
+			_gnix_convert_key_to_mhdl_no_crc(
+					(gnix_mr_key_t *)&more_req->rma.rem_mr_key,
+					&mdh);
+			more_put[idx].remote_mem_hndl = mdh;
 
 			if (idx < entries)
 				more_put[idx].next_descr = &more_put[idx + 1];
@@ -872,10 +884,8 @@ int _gnix_rma_more_post_req(void *data)
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	__gnix_rma_more_fill_pd(fab_req, txd, &mdh, write_req);
+	__gnix_rma_more_fill_pd(fab_req, txd, write_req);
 
-	/* Not sure if this portion is necessary or not - review
-	 * This might only be needed when doing Writes */
 	if (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) {
 		GNIX_INFO(FI_LOG_EP_DATA, "MORE: Doing a Write\n");
 		txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
