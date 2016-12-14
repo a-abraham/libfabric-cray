@@ -125,9 +125,8 @@ static int __gnix_rma_send_completion(struct gnix_fid_ep *ep,
 	return FI_SUCCESS;
 }
 
-static void __gnix_rma_copy_indirect_get_data(struct gnix_tx_descriptor *txd)
+static void __gnix_rma_copy_indirect_get_data(struct gnix_fab_req *req)
 {
-	struct gnix_fab_req *req = txd->req;
 	int head_off = req->rma.rem_addr & GNI_READ_ALIGN_MASK;
 
 	memcpy((void *)req->rma.loc_addr,
@@ -135,9 +134,8 @@ static void __gnix_rma_copy_indirect_get_data(struct gnix_tx_descriptor *txd)
 	       req->rma.len);
 }
 
-static void __gnix_rma_copy_chained_get_data(struct gnix_tx_descriptor *txd)
+static void __gnix_rma_copy_chained_get_data(struct gnix_fab_req *req)
 {
-	struct gnix_fab_req *req = txd->req;
 	int head_off, head_len, tail_len;
 	void *addr;
 
@@ -395,11 +393,21 @@ static int __gnix_rma_more_txd_complete(void *arg, gni_return_t tx_status)
 	struct slist_entry *item;
 	int rc = FI_SUCCESS;
 
+	if (tx_status != GNI_RC_SUCCESS) {
+		return __gnix_rma_post_err(req, FI_ECANCELED);
+	}
+
 	free(txd->gni_more_ct_descs);
 	_gnix_nic_tx_free(req->gnix_ep->nic, txd);
 
-	if (tx_status != GNI_RC_SUCCESS) {
-		return __gnix_rma_post_err(req, FI_ECANCELED);
+	/* Successful Delivery. Copy any unaligned data if read req. */
+	if ((req->flags & FI_MORE) && (req->type == GNIX_FAB_RQ_RDMA_READ)) {
+		__gnix_rma_copy_chained_get_data(req);
+		slist_entry_foreach(req->rma.sle.next, item) {
+			more_req = container_of(item, struct gnix_fab_req,
+						rma.sle);
+			__gnix_rma_copy_chained_get_data(more_req);
+		}
 	}
 
 	/* complete request */
@@ -437,7 +445,7 @@ static int __gnix_rma_txd_complete(void *arg, gni_return_t tx_status)
 		 * move unaligned head and/or tail.  If this is the FMA TXD,
 		 * copy the unaligned data to the user buffer. */
 		if (txd->gni_desc.type == GNI_POST_FMA_GET)
-			__gnix_rma_copy_chained_get_data(txd);
+			__gnix_rma_copy_chained_get_data(req);
 
 		/* Remember any failure.  Retransmit both TXDs once both are
 		 * complete. */
@@ -462,10 +470,10 @@ static int __gnix_rma_txd_complete(void *arg, gni_return_t tx_status)
 
 	/* Successful delivery.  Progress request. */
 	if (req->flags & GNIX_RMA_INDIRECT) {
-		__gnix_rma_copy_indirect_get_data(txd);
+		__gnix_rma_copy_indirect_get_data(req);
 	} else if (req->flags & GNIX_RMA_CHAINED &&
 		   !(req->flags & GNIX_RMA_RDMA)) {
-		__gnix_rma_copy_chained_get_data(txd);
+		__gnix_rma_copy_chained_get_data(req);
 	}
 
 	_gnix_nic_tx_free(req->gnix_ep->nic, txd);
@@ -829,6 +837,70 @@ int _gnix_rma_post_rdma_chain_req(void *data)
 	return FI_SUCCESS;
 }
 
+/* Fill head and tail descriptors for chained gets */
+static void __gnix_rma_more_fill_sub_htd(struct gnix_fab_req *req,
+					gni_ct_get_post_descriptor_t *more_get,
+					gni_mem_handle_t *rem_mdh,
+					int *idx, int *entries)
+{
+	int head_off, tail_len;
+	struct gnix_fid_ep *ep = req->gnix_ep;
+
+	head_off = req->rma.rem_addr & GNI_READ_ALIGN_MASK;
+	tail_len = (req->rma.rem_addr + req->rma.len)
+		& GNI_READ_ALIGN_MASK;
+
+	/* Get int_tx_buf if unaligned */
+	if ((req->int_tx_buf_e == NULL) && (head_off || tail_len)) {
+		req->int_tx_buf_e = _gnix_ep_get_int_tx_buf(ep);
+		if (req->int_tx_buf == NULL) {
+			GNIX_FATAL(FI_LOG_EP_DATA, "RAN OUT OF INT_TX_BUFS");
+			/* TODO Create growable list of buffers */
+		}
+	} else {
+		return;
+	}
+
+	req->int_tx_buf = ((struct gnix_int_tx_buf *)
+				req->int_tx_buf_e)->buf;
+	req->int_tx_mdh = _gnix_ep_get_int_tx_mdh(ep);
+
+	if (head_off) {
+		more_get[*idx].ep_hndl = req->vc->gni_ep;
+		more_get[*idx].length = GNI_READ_ALIGN;
+		more_get[*idx].remote_addr =
+				req->rma.rem_addr & ~GNI_READ_ALIGN_MASK;
+		more_get[*idx].remote_mem_hndl = *rem_mdh;
+		more_get[*idx].local_addr = (uint64_t)req->int_tx_buf;
+		more_get[*idx].local_mem_hndl = req->int_tx_mdh;
+
+		if (*idx < (*entries) - 1)
+			more_get[*idx].next_descr = &more_get[(*idx) + 1];
+		else
+			more_get[*idx].next_descr = NULL;
+
+		(*idx)++;
+	}
+	if (tail_len) {
+		more_get[*idx].ep_hndl = req->vc->gni_ep;
+		more_get[*idx].length = GNI_READ_ALIGN;
+		more_get[*idx].remote_addr =
+				(req->rma.rem_addr +
+				 req->rma.len) & ~GNI_READ_ALIGN_MASK;
+		more_get[*idx].remote_mem_hndl = *rem_mdh;
+		more_get[*idx].local_addr =
+				(uint64_t)req->int_tx_buf + GNI_READ_ALIGN;
+		more_get[*idx].local_mem_hndl = req->int_tx_mdh;
+		more_get[*idx].next_descr = NULL;
+
+		if (*idx < (*entries) - 1)
+				more_get[*idx].next_descr = &more_get[(*idx) + 1];
+			else
+				more_get[*idx].next_descr = NULL;
+		(*idx)++;
+	}
+}
+
 static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 				    struct gnix_tx_descriptor *txd)
 {
@@ -836,17 +908,53 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 	gni_ct_get_post_descriptor_t *more_get = NULL;
 	gni_mem_handle_t mdh;
 	struct gnix_fab_req *more_req;
+	struct gnix_fid_mem_desc *loc_md;
 	struct slist_entry *item;
-	int entries = 0, idx = 0;
+	int head_off, head_len, tail_len, entries = 0, idx = 0;
 
-	/* Count number of post-descriptors to be chained. */
+	/* If top level fab_req is unaligned, increment entries. */
+	if (req->type == GNIX_FAB_RQ_RDMA_READ) {
+		head_off = req->rma.rem_addr & GNI_READ_ALIGN_MASK;
+		head_len = head_off ? GNI_READ_ALIGN - head_off : 0;
+		tail_len = (req->rma.rem_addr + req->rma.len)
+			& GNI_READ_ALIGN_MASK;
+		if (head_off) {
+			entries++;
+		}
+		if (tail_len) {
+			entries++;
+		}
+		/* Populate txd */
+		txd->gni_desc.local_addr = (uint64_t)req->rma.loc_addr + head_len;
+		txd->gni_desc.remote_addr = (uint64_t)req->rma.rem_addr + head_len;
+		txd->gni_desc.length = req->rma.len - head_len - tail_len;
+		assert(txd->gni_desc.length);
+	}
+
+	/* Count number of sub post-descriptors to be chained. */
 	slist_entry_foreach(req->rma.sle.next, item) {
-		entries++;
+		entries++; /* Increment regardless of type */
+		/* Get fab_req pointer */
+		if (req->type == GNIX_FAB_RQ_RDMA_READ) {
+			more_req = container_of(item, struct gnix_fab_req,
+						rma.sle);
+			head_off = more_req->rma.rem_addr & GNI_READ_ALIGN_MASK;
+			head_len = head_off ? GNI_READ_ALIGN - head_off : 0;
+			tail_len = (more_req->rma.rem_addr + more_req->rma.len)
+				& GNI_READ_ALIGN_MASK;
+
+			/* Additional increments if unaligned */
+			if (head_off)
+				entries++;
+			if (tail_len)
+				entries++;
+		}
 	}
 
 	GNIX_DEBUG(FI_LOG_EP_DATA, "FI_MORE: %d sub descs to be populated\n",
 		  entries);
 
+	/* Allocate space for sub descriptors */
 	if (req->type == GNIX_FAB_RQ_RDMA_WRITE) {
 		txd->gni_more_ct_descs = malloc(entries *
 					 sizeof(gni_ct_put_post_descriptor_t));
@@ -857,13 +965,17 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 					 sizeof(gni_ct_get_post_descriptor_t));
 		more_get = (gni_ct_get_post_descriptor_t *)
 			   txd->gni_more_ct_descs;
+		/* Populate Head and Tail of TOP Req if req is unaligned */
+		 __gnix_rma_more_fill_sub_htd(req, more_get,
+			&txd->gni_desc.remote_mem_hndl, &idx, &entries);
 	}
 
+	/* Populate sub descriptors */
 	slist_entry_foreach(req->rma.sle.next, item) {
 		/* Get fab_req pointer */
 		more_req = container_of(item, struct gnix_fab_req, rma.sle);
 
-		/* Populate txd based on type */
+		/* Populate  based on type */
 		if (req->type == GNIX_FAB_RQ_RDMA_WRITE) {
 			assert(more_put);
 			more_put[idx].ep_hndl = more_req->vc->gni_ep;
@@ -881,15 +993,33 @@ static void __gnix_rma_more_fill_pd(struct gnix_fab_req *req,
 				more_put[idx].next_descr = &more_put[idx + 1];
 			else
 				more_put[idx].next_descr = NULL;
+			idx++;
 		} else {
-			/* TODO Populate for reads*/
 			assert(more_get);
-			if (idx < entries - 1)
+
+			/* get main aligned data in first transaction */
+			loc_md = (struct gnix_fid_mem_desc *)more_req->rma.loc_md;
+			more_get[idx].ep_hndl = more_req->vc->gni_ep;
+			more_get[idx].local_mem_hndl = loc_md->mem_hndl;
+			more_get[idx].local_addr = (uint64_t)more_req->rma.loc_addr + head_len;
+			more_get[idx].remote_addr = (uint64_t)more_req->rma.rem_addr + head_len;
+			more_get[idx].length = more_req->rma.len - head_len - tail_len;
+			assert(more_get[idx].length);
+
+			_gnix_convert_key_to_mhdl_no_crc(
+				(gnix_mr_key_t *)&more_req->rma.rem_mr_key,
+				&mdh);
+			more_get[idx].remote_mem_hndl = mdh;
+
+			if (idx < entries - 1) {
 				more_get[idx].next_descr = &more_get[idx + 1];
-			else
+			} else {
 				more_get[idx].next_descr = NULL;
+			}
+			/* head/tail function */
+			__gnix_rma_more_fill_sub_htd(more_req, more_get, &mdh,
+					&idx, &entries);
 		}
-		idx++;
 	}
 
 	if (req->type == GNIX_FAB_RQ_RDMA_WRITE) {
@@ -938,23 +1068,20 @@ int _gnix_rma_more_post_req(void *data)
 	txd->gni_desc.cq_mode = GNI_CQMODE_GLOBAL_EVENT; /* check flags */
 	txd->gni_desc.dlvr_mode = GNI_DLVMODE_PERFORMANCE; /* check flags */
 
-	__gnix_rma_more_fill_pd(fab_req, txd);
-
 	if (fab_req->type == GNIX_FAB_RQ_RDMA_WRITE) {
-		GNIX_INFO(FI_LOG_EP_DATA, "MORE: Doing a Write\n");
 		txd->gni_desc.local_addr = (uint64_t)fab_req->rma.loc_addr;
 		txd->gni_desc.length = fab_req->rma.len;
 		assert(txd->gni_desc.length);
 		txd->gni_desc.remote_addr = (uint64_t)fab_req->rma.rem_addr;
-
-		loc_md = (struct gnix_fid_mem_desc *)fab_req->rma.loc_md;
-		if (loc_md) {
-			txd->gni_desc.local_mem_hndl = loc_md->mem_hndl;
-		}
 	}
+
+	loc_md = (struct gnix_fid_mem_desc *)fab_req->rma.loc_md;
+	txd->gni_desc.local_mem_hndl = loc_md->mem_hndl; /* assert? */
 	txd->gni_desc.remote_mem_hndl = mdh;
 	txd->gni_desc.rdma_mode = 0; /* check flags */
 	txd->gni_desc.src_cq_hndl = nic->tx_cq; /* check flags */
+
+	__gnix_rma_more_fill_pd(fab_req, txd);
 
 	GNIX_LOG_DUMP_TXD(txd);
 
@@ -1242,10 +1369,10 @@ ssize_t _gnix_rma(struct gnix_fid_ep *ep, enum gnix_fab_req_type fr_type,
 			slist_insert_tail(&req->rma.sle, &ep->more_write);
 			req->work_fn = _gnix_rma_more_post_req;
 		} else if (fr_type == GNIX_FAB_RQ_RDMA_READ) {
-			/* Not fully implemented. List won't be populated. */
-			/* slist_insert_tail(&req->rma.sle, &ep->more_read); */
+			slist_insert_tail(&req->rma.sle, &ep->more_read);
+			req->work_fn = _gnix_rma_more_post_req;
 		}
-		if ((flags & FI_MORE) && (fr_type == GNIX_FAB_RQ_RDMA_WRITE))
+		if (flags & FI_MORE)
 			return FI_SUCCESS;
 	}
 
