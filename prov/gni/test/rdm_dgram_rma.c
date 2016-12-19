@@ -1604,6 +1604,88 @@ Test(dgram_rma_1dom, readmsg)
 	xfer_for_each_size(do_readmsg, 8, BUF_SZ);
 }
 
+void do_readmsg_more(int len)
+{
+	int ret;
+	ssize_t sz;
+	struct fi_cq_tagged_entry cqe = { (void *) -1, UINT_MAX, UINT_MAX,
+					  (void *) -1, UINT_MAX, UINT_MAX };
+	struct iovec iov, iov2;
+	struct fi_msg_rma msg, msg2;
+	struct fi_rma_iov rma_iov, rma_iov2;
+	uint64_t w[2] = {0}, r[2] = {0}, w_e[2] = {0}, r_e[2] = {0};
+
+	iov.iov_base = source;
+	iov.iov_len = len;
+
+	rma_iov.addr = (uint64_t)target;
+	rma_iov.len = len;
+	rma_iov.key = mr_key[1];
+
+	msg.msg_iov = &iov;
+	msg.desc = (void **)loc_mr;
+	msg.iov_count = 1;
+	msg.addr = gni_addr[1];
+	msg.rma_iov = &rma_iov;
+	msg.rma_iov_count = 1;
+	msg.context = target;
+	msg.data = (uint64_t)target;
+
+	iov2.iov_base = source2;
+	iov2.iov_len = len;
+
+	rma_iov2.addr = (uint64_t)target2;
+	rma_iov2.len = len;
+	rma_iov2.key = mr_key2[1];
+
+	msg2.msg_iov = &iov2;
+	msg2.desc = (void **)loc_mr2;
+	msg2.iov_count = 1;
+	msg2.addr = gni_addr[1];
+	msg2.rma_iov = &rma_iov2;
+	msg2.rma_iov_count = 1;
+	msg2.context = target2;
+	msg2.data = (uint64_t)target2;
+
+
+	init_data(target, len, 0xef);
+	init_data(target2, len, 0xff);
+	init_data(source, len, 0);
+	init_data(source2, len, 0);
+
+	sz = fi_readmsg(ep[0], &msg, FI_MORE);
+	cr_assert_eq(sz, 0);
+	sz = fi_readmsg(ep[0], &msg2, 0);
+	cr_assert_eq(sz, 0);
+
+	while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
+		pthread_yield();
+	}
+
+	cr_assert_eq(ret, 1);
+	rdm_rma_check_tcqe(&cqe, target, FI_RMA | FI_READ, 0);
+
+	while ((ret = fi_cq_read(send_cq[0], &cqe, 1)) == -FI_EAGAIN) {
+		pthread_yield();
+	}
+
+	cr_assert_eq(ret, 1);
+	rdm_rma_check_tcqe(&cqe, target2, FI_RMA | FI_READ, 0);
+
+	r[0] = 2;
+	rdm_rma_check_cntrs(w, r, w_e, r_e);
+
+	dbg_printf("got write context event!\n");
+
+	cr_assert(check_data(source, target, len), "Data mismatch");
+	cr_assert(check_data(source2, target2, len), "Data mismatch");
+}
+
+Test(rdm_rma, readmsgmore)
+{
+	xfer_for_each_size(do_readmsg_more, 8, BUF_SZ);
+}
+
 #define READ_DATA 0xdededadadeaddeef
 void do_readmsgdata(int len)
 {
